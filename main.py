@@ -39,6 +39,12 @@ def g(obj: Any, *names: str, default=None):
     return default
 
 
+def _floor_to_4h(dt_utc: datetime) -> datetime:
+    """Floor a UTC datetime to the most recent closed 4h boundary (00,04,08,12,16,20)."""
+    dt_utc = dt_utc.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    return dt_utc.replace(hour=(dt_utc.hour // 4) * 4)
+
+
 # ============== Sheets helpers ==============
 def get_google_client():
     raw = os.getenv("GOOGLE_CREDS_JSON")
@@ -103,15 +109,20 @@ def all_usd_products() -> List[str]:
 
 
 def get_candles_4h(product_id: str, bars: int) -> pd.DataFrame:
-    """Fetch 4H candles and return a clean ascending DataFrame."""
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=bars * 4 + 12)  # padding
+    """Fetch FOUR_HOUR candles using epoch seconds, aligned to closed candle boundaries."""
+    end_dt = _floor_to_4h(datetime.now(timezone.utc))          # last CLOSED 4h mark
+    start_dt = end_dt - timedelta(hours=bars * 4)
+
+    start_epoch = int(start_dt.timestamp())
+    end_epoch   = int(end_dt.timestamp())
+
     resp = CB.get_candles(
         product_id=product_id,
-        start=start.isoformat(),
-        end=end.isoformat(),
-        granularity="FOUR_HOUR",
+        start=start_epoch,     # epoch seconds
+        end=end_epoch,         # epoch seconds
+        granularity="FOUR_HOUR"
     )
+
     rows = g(resp, "candles") or (resp if isinstance(resp, list) else [])
     out = []
     for c in rows:
