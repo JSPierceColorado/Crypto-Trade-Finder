@@ -7,21 +7,31 @@ import pandas as pd
 import numpy as np
 from coinbase.rest import RESTClient  # coinbase-advanced-py
 
-# ============== Config ==============
+# ---------- Config ----------
 SHEET_NAME        = os.getenv("SHEET_NAME", "Trading Log")
 PRODUCTS_TAB      = os.getenv("CRYPTO_PRODUCTS_TAB", "crypto_products")
 SCREENER_TAB      = os.getenv("CRYPTO_SCREENER_TAB", "crypto_screener")
+LOG_TAB           = os.getenv("CRYPTO_LOG_TAB", "crypto_log")
+COST_TAB          = os.getenv("CRYPTO_COST_TAB", "crypto_cost")
 
-LOOKBACK_4H       = int(os.getenv("LOOKBACK_4H", "200"))                 # number of 4h bars
-MIN_24H_NOTIONAL  = float(os.getenv("MIN_24H_NOTIONAL", "2000000"))      # USD
+LOOKBACK_4H       = int(os.getenv("LOOKBACK_4H", "200"))            # number of 4h bars
+MIN_24H_NOTIONAL  = float(os.getenv("MIN_24H_NOTIONAL", "2000000")) # USD
 RSI_MIN           = float(os.getenv("RSI_MIN", "50"))
 RSI_MAX           = float(os.getenv("RSI_MAX", "65"))
-MAX_EXT_EMA20_PCT = float(os.getenv("MAX_EXT_EMA20_PCT", "0.08"))        # 8%
+MAX_EXT_EMA20_PCT = float(os.getenv("MAX_EXT_EMA20_PCT", "0.08"))   # 8%
 REQUIRE_7D_HIGH   = os.getenv("REQUIRE_7D_HIGH", "true").lower() in ("1","true","yes")
+PER_PRODUCT_SLEEP = float(os.getenv("PER_PRODUCT_SLEEP", "0.15"))
 
-PER_PRODUCT_SLEEP = float(os.getenv("PER_PRODUCT_SLEEP", "0.15"))        # nicer to the API
+# ---------- Headers shared with other bots ----------
+SCREENER_HEADERS = [
+    "Product","Price","EMA_20","SMA_50","RSI_14",
+    "MACD","Signal","MACD_Hist","MACD_Hist_Δ",
+    "Vol24hUSD","7D_High","Breakout","Bullish Signal","Buy Reason","Timestamp"
+]
+LOG_HEADERS = ["Timestamp","Action","Product","ProceedsUSD","Qty","OrderID","Status","Note"]
+COST_HEADERS = ["Product","Qty","DollarCost","AvgCostUSD","UpdatedAt"]
 
-# ============== Small utils ==============
+# ---------- Small utils ----------
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -40,53 +50,75 @@ def _floor_to_4h(dt_utc: datetime) -> datetime:
     dt_utc = dt_utc.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
     return dt_utc.replace(hour=(dt_utc.hour // 4) * 4)
 
-# Dynamic precision helpers for tiny-priced coins
+# dynamic precision for tiny-priced coins
 def dyn_decimals(price: float, base=6, cap=12) -> int:
-    if price <= 0:
-        return base
+    if price <= 0: return base
     mag = int(max(0, -math.floor(math.log10(price))))
     return min(cap, base + mag)
 
-def r_prec(x: float, d: int):
-    return round(float(x), d)
+def r_prec(x: float, d: int): return round(float(x), d)
 
-# ============== Sheets helpers ==============
+# ---------- Sheets helpers (creates all tabs/headers) ----------
 def get_google_client():
     raw = os.getenv("GOOGLE_CREDS_JSON")
     if not raw:
         raise RuntimeError("Missing GOOGLE_CREDS_JSON")
     return gspread.service_account_from_dict(json.loads(raw))
 
-def _get_ws(gc, tab_name: str):
-    sh = gc.open(SHEET_NAME)
+def _open_sheet(gc):
     try:
-        return sh.worksheet(tab_name)
+        return gc.open(SHEET_NAME)
+    except gspread.exceptions.SpreadsheetNotFound:
+        # Optional: create if the spreadsheet itself was deleted
+        sh = gc.create(SHEET_NAME)
+        return sh
+
+def _ensure_tab(sh, title: str, headers: List[str], keep_data: bool):
+    """Create tab if missing. If keep_data=False, clear then set header. Otherwise only set header if missing."""
+    try:
+        ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        return sh.add_worksheet(title=tab_name, rows="2000", cols="50")
+        ws = sh.add_worksheet(title=title, rows="2000", cols="50")
+
+    values = ws.get_values("A1:%s1" % chr(ord('A') + len(headers) - 1))
+    need_headers = (not values) or (values[0] != headers)
+
+    if not keep_data:
+        ws.clear()
+        ws.update(range_name=f"A1:{chr(ord('A')+len(headers)-1)}1", values=[headers])
+    else:
+        if need_headers:
+            ws.update(range_name=f"A1:{chr(ord('A')+len(headers)-1)}1", values=[headers])
+
+    try: ws.freeze(rows=1)
+    except Exception: pass
+    return ws
+
+def ensure_all_tabs(gc):
+    sh = _open_sheet(gc)
+    ws_products = _ensure_tab(sh, PRODUCTS_TAB, ["Product"], keep_data=False)   # finder always rewrites this
+    ws_screener = _ensure_tab(sh, SCREENER_TAB, SCREENER_HEADERS, keep_data=False)  # finder rewrites
+    ws_log      = _ensure_tab(sh, LOG_TAB, LOG_HEADERS, keep_data=True)        # preserve history
+    ws_cost     = _ensure_tab(sh, COST_TAB, COST_HEADERS, keep_data=True)      # preserve basis
+    return ws_products, ws_screener, ws_log, ws_cost
 
 def write_products(ws, products: List[str]):
     ws.clear()
-    ws.append_row(["Product"])
+    ws.update(range_name="A1:A1", values=[["Product"]])
     if products:
         ws.append_rows([[p] for p in products], value_input_option="USER_ENTERED")
 
 def write_screener(ws, rows: List[List[Any]]):
     ws.clear()
-    headers = [
-        "Product","Price","EMA_20","SMA_50","RSI_14",
-        "MACD","Signal","MACD_Hist","MACD_Hist_Δ",
-        "Vol24hUSD","7D_High","Breakout","Bullish Signal","Buy Reason","Timestamp"
-    ]
-    ws.append_row(headers)
+    ws.append_row(SCREENER_HEADERS)
     for i in range(0, len(rows), 100):
         ws.append_rows(rows[i:i+100], value_input_option="USER_ENTERED")
 
-# ============== Coinbase helpers ==============
-CB = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET
+# ---------- Coinbase helpers ----------
+CB = RESTClient()  # uses env keys
 
 def all_usd_products() -> List[str]:
-    prods = []
-    cursor = None
+    prods, cursor = [], None
     while True:
         resp = CB.get_products(limit=250, cursor=cursor) if cursor else CB.get_products(limit=250)
         products = g(resp, "products") or (resp if isinstance(resp, list) else [])
@@ -95,47 +127,36 @@ def all_usd_products() -> List[str]:
             if not pid:
                 base = g(p, "base_currency", "baseCurrency", "base")
                 quote = g(p, "quote_currency", "quoteCurrency", "quote")
-                if base and quote:
-                    pid = f"{base}-{quote}"
+                if base and quote: pid = f"{base}-{quote}"
             status = (g(p, "status", "trading_status", "tradingStatus", default="") or "").upper()
             if pid and pid.endswith("-USD") and status == "ONLINE":
                 prods.append(pid)
         cursor = g(resp, "cursor")
-        if not cursor:
-            break
+        if not cursor: break
     return sorted(dict.fromkeys(prods))
 
-def get_candles_4h(product_id: str, bars: int) -> pd.DataFrame:
+def _floor_endpoints_4h(bars:int):
     end_dt = _floor_to_4h(datetime.now(timezone.utc))
     start_dt = end_dt - timedelta(hours=bars * 4)
+    return int(start_dt.timestamp()), int(end_dt.timestamp())
 
-    start_epoch = int(start_dt.timestamp())
-    end_epoch   = int(end_dt.timestamp())
-
-    resp = CB.get_candles(
-        product_id=product_id,
-        start=start_epoch,
-        end=end_epoch,
-        granularity="FOUR_HOUR"
-    )
-
+def get_candles_4h(product_id: str, bars: int) -> pd.DataFrame:
+    start_epoch, end_epoch = _floor_endpoints_4h(bars)
+    resp = CB.get_candles(product_id=product_id, start=start_epoch, end=end_epoch, granularity="FOUR_HOUR")
     rows = g(resp, "candles") or (resp if isinstance(resp, list) else [])
-    out = []
-    for c in rows:
-        out.append({
-            "start":  g(c, "start"),
-            "open":   float(g(c, "open",   default=0) or 0),
-            "high":   float(g(c, "high",   default=0) or 0),
-            "low":    float(g(c, "low",    default=0) or 0),
-            "close":  float(g(c, "close",  default=0) or 0),
-            "volume": float(g(c, "volume", default=0) or 0),
-        })
-    if not out:
-        return pd.DataFrame()
+    if not rows: return pd.DataFrame()
+    out = [{
+        "start":  g(c, "start"),
+        "open":   float(g(c, "open",   default=0) or 0),
+        "high":   float(g(c, "high",   default=0) or 0),
+        "low":    float(g(c, "low",    default=0) or 0),
+        "close":  float(g(c, "close",  default=0) or 0),
+        "volume": float(g(c, "volume", default=0) or 0),
+    } for c in rows]
     df = pd.DataFrame(out).sort_values("start")
     return df.tail(bars).reset_index(drop=True)
 
-# ============== Indicators ==============
+# ---------- Indicators ----------
 def ema(s, w): return s.ewm(span=w, adjust=False).mean()
 def sma(s, w): return s.rolling(w).mean()
 
@@ -153,11 +174,10 @@ def macd(series, fast=12, slow=26, signal=9):
     hist = line - sig
     return line, sig, hist
 
-# ============== Analyze one ==============
+# ---------- Analyze one ----------
 def analyze(product_id: str):
     df = get_candles_4h(product_id, LOOKBACK_4H)
-    if df.empty or df.shape[0] < 60:
-        return None
+    if df.empty or df.shape[0] < 60: return None
 
     close = pd.to_numeric(df["close"], errors="coerce").astype(float)
     vol   = pd.to_numeric(df["volume"], errors="coerce").astype(float)
@@ -174,26 +194,16 @@ def analyze(product_id: str):
     hist_prev = float(macd_hist.iloc[-2]) if macd_hist.shape[0] >= 2 else np.nan
     hist_delta= hist_v - hist_prev if not math.isnan(hist_prev) else np.nan
 
-    # 24h notional (6 x 4h bars)
     vol24_usd = float((close.tail(6) * vol.tail(6)).sum())
-
-    # 7D high (42 x 4h bars) from closes
     high_7d = float(close.tail(42).max())
     breakout = price >= high_7d - 1e-9
 
-    # Filters
-    if not (price > ema20 > sma50):
-        return None
-    if (price / ema20 - 1.0) > MAX_EXT_EMA20_PCT:
-        return None
-    if not (RSI_MIN < rsi14 < RSI_MAX):
-        return None
-    if not (macd_v > signal_v and hist_v > 0 and (not math.isnan(hist_delta) and hist_delta > 0)):
-        return None
-    if vol24_usd < MIN_24H_NOTIONAL:
-        return None
-    if REQUIRE_7D_HIGH and not breakout:
-        return None
+    if not (price > ema20 > sma50): return None
+    if (price / ema20 - 1.0) > MAX_EXT_EMA20_PCT: return None
+    if not (RSI_MIN < rsi14 < RSI_MAX): return None
+    if not (macd_v > signal_v and hist_v > 0 and (not math.isnan(hist_delta) and hist_delta > 0)): return None
+    if vol24_usd < MIN_24H_NOTIONAL: return None
+    if REQUIRE_7D_HIGH and not breakout: return None
 
     reason = (
         f"4h Uptrend (P>EMA20>SMA50), RSI {RSI_MIN}-{RSI_MAX}, "
@@ -201,8 +211,7 @@ def analyze(product_id: str):
         f"24h notional ≥ ${int(MIN_24H_NOTIONAL):,}" + (" + 7D breakout" if REQUIRE_7D_HIGH else "")
     )
 
-    # dynamic precision for tiny-priced assets
-    d = dyn_decimals(price)
+    d  = dyn_decimals(price)
     d2 = min(14, d + 2)
 
     row = [
@@ -224,13 +233,14 @@ def analyze(product_id: str):
     ]
     return row
 
-# ============== Main ==============
+# ---------- Main ----------
 def main():
-    print("🚀 crypto-finder starting")
+    print("🚀 crypto-finder starting (sheet bootstrapper)")
     gc = get_google_client()
-    ws_products = _get_ws(gc, PRODUCTS_TAB)
-    ws_screener = _get_ws(gc, SCREENER_TAB)
 
+    ws_products, ws_screener, ws_log, ws_cost = ensure_all_tabs(gc)  # sets up tabs/headers
+
+    # fetch list of tradable USD products
     products = all_usd_products()
     write_products(ws_products, products)
     print(f"📦 ONLINE USD products: {len(products)}")
@@ -239,8 +249,7 @@ def main():
     for i, pid in enumerate(products, 1):
         try:
             r = analyze(pid)
-            if r:
-                rows.append(r)
+            if r: rows.append(r)
         except Exception as e:
             print(f"⚠️ {pid} analyze error: {e}")
         if i % 20 == 0:
@@ -249,6 +258,7 @@ def main():
 
     write_screener(ws_screener, rows)
     print(f"✅ Screener wrote {len(rows)} picks to {SCREENER_TAB}")
+    print("🧰 Tabs ensured:", PRODUCTS_TAB, SCREENER_TAB, LOG_TAB, COST_TAB)
 
 if __name__ == "__main__":
     try:
