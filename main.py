@@ -1,4 +1,4 @@
-import os, json, time, math
+import os, json, time, math, random
 from datetime import datetime, timedelta, timezone
 from typing import List, Any
 
@@ -174,17 +174,21 @@ def analyze(product_id: str):
     hist_prev = float(macd_hist.iloc[-2]) if macd_hist.shape[0] >= 2 else np.nan
     hist_delta= hist_v - hist_prev if not math.isnan(hist_prev) else np.nan
 
+    # 24h notional (6 x 4h bars)
     vol24_usd = float((close.tail(6) * vol.tail(6)).sum())
+
+    # 7D high (42 x 4h bars) from closes
     high_7d = float(close.tail(42).max())
     breakout = price >= high_7d - 1e-9
 
+    # Filters
     if not (price > ema20 > sma50):
         return None
     if (price / ema20 - 1.0) > MAX_EXT_EMA20_PCT:
         return None
     if not (RSI_MIN < rsi14 < RSI_MAX):
         return None
-    if not ( (macd_v > signal_v) and (hist_v > 0) and (not math.isnan(hist_delta) and hist_delta > 0) ):
+    if not (macd_v > signal_v and hist_v > 0 and (not math.isnan(hist_delta) and hist_delta > 0)):
         return None
     if vol24_usd < MIN_24H_NOTIONAL:
         return None
@@ -198,7 +202,7 @@ def analyze(product_id: str):
     )
 
     # dynamic precision for tiny-priced assets
-    d = dyn_decimals(price)         # base precision tied to price magnitude
+    d = dyn_decimals(price)
     d2 = min(14, d + 2)
 
     row = [
