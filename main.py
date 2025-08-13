@@ -75,13 +75,14 @@ def _ensure_tab(sh, title: str, headers: List[str], clear_first: bool):
         ws = sh.add_worksheet(title=title, rows="2000", cols="50")
     if clear_first:
         ws.clear()
-    # ensure header row
     end_col = chr(ord('A') + len(headers) - 1)
     vals = ws.get_values(f"A1:{end_col}1")
     if not vals or vals[0] != headers:
         ws.update(range_name=f"A1:{end_col}1", values=[headers])
-    try: ws.freeze(rows=1)
-    except Exception: pass
+    try:
+        ws.freeze(rows=1)
+    except Exception:
+        pass
     return ws
 
 def ensure_tabs(gc):
@@ -116,12 +117,14 @@ def all_usd_products() -> List[str]:
             if not pid:
                 base = g(p, "base_currency", "baseCurrency", "base")
                 quote = g(p, "quote_currency", "quoteCurrency", "quote")
-                if base and quote: pid = f"{base}-{quote}"
+                if base and quote:
+                    pid = f"{base}-{quote}"
             status = (g(p, "status", "trading_status", "tradingStatus", default="") or "").upper()
             if pid and pid.endswith("-USD") and status == "ONLINE":
                 prods.append(pid)
         cursor = g(resp, "cursor")
-        if not cursor: break
+        if not cursor:
+            break
     return sorted(dict.fromkeys(prods))
 
 def _floor_endpoints_4h(bars:int):
@@ -133,7 +136,8 @@ def get_candles_4h(product_id: str, bars: int) -> pd.DataFrame:
     start_epoch, end_epoch = _floor_endpoints_4h(bars)
     resp = CB.get_candles(product_id=product_id, start=start_epoch, end=end_epoch, granularity="FOUR_HOUR")
     rows = g(resp, "candles") or (resp if isinstance(resp, list) else [])
-    if not rows: return pd.DataFrame()
+    if not rows:
+        return pd.DataFrame()
     out = [{
         "start":  g(c, "start"),
         "open":   float(g(c, "open",   default=0) or 0),
@@ -166,7 +170,8 @@ def macd(series, fast=12, slow=26, signal=9):
 # ---------- Analyze one ----------
 def analyze(product_id: str):
     df = get_candles_4h(product_id, LOOKBACK_4H)
-    if df.empty or df.shape[0] < 60: return None
+    if df.empty or df.shape[0] < 60:
+        return None
 
     close = pd.to_numeric(df["close"], errors="coerce").astype(float)
     vol   = pd.to_numeric(df["volume"], errors="coerce").astype(float)
@@ -184,15 +189,22 @@ def analyze(product_id: str):
     hist_delta= hist_v - hist_prev if not math.isnan(hist_prev) else np.nan
 
     vol24_usd = float((close.tail(6) * vol.tail(6)).sum())
-    high_7d = float(close.tail(42).max())
-    breakout = price >= high_7d - 1e-9
+    high_7d   = float(close.tail(42).max())
+    breakout  = price >= high_7d - 1e-9
 
-    if not (price > ema20 > sma50): return None
-    if (price / ema20 - 1.0) > MAX_EXT_EMA20_PCT: return None
-    if not (RSI_MIN < rsi14 < RSI_MAX): return None
-    if not (macd_v > signal_v and hist_v > 0 and (not math.isnan(hist_delta) and hist_delta > 0)): return None
-    if vol24_usd < MIN_24H_NOTIONAL): return None
-    if REQUIRE_7D_HIGH and not breakout: return None
+    # Filters
+    if not (price > ema20 > sma50):
+        return None
+    if (price / ema20 - 1.0) > MAX_EXT_EMA20_PCT:
+        return None
+    if not (RSI_MIN < rsi14 < RSI_MAX):
+        return None
+    if not (macd_v > signal_v and hist_v > 0 and (not math.isnan(hist_delta) and hist_delta > 0)):
+        return None
+    if vol24_usd < MIN_24H_NOTIONAL:
+        return None
+    if REQUIRE_7D_HIGH and not breakout:
+        return None
 
     reason = (
         f"4h Uptrend (P>EMA20>SMA50), RSI {RSI_MIN}-{RSI_MAX}, "
@@ -200,7 +212,9 @@ def analyze(product_id: str):
         f"24h notional ≥ ${int(MIN_24H_NOTIONAL):,}" + (" + 7D breakout" if REQUIRE_7D_HIGH else "")
     )
 
-    d  = dyn_decimals(price); d2 = min(14, d + 2)
+    d  = dyn_decimals(price)
+    d2 = min(14, d + 2)
+
     return [
         product_id,
         r_prec(price, d),
@@ -233,7 +247,8 @@ def main():
     for i, pid in enumerate(products, 1):
         try:
             r = analyze(pid)
-            if r: rows.append(r)
+            if r:
+                rows.append(r)
         except Exception as e:
             print(f"⚠️ {pid} analyze error: {e}")
         if i % 20 == 0:
