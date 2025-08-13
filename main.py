@@ -7,7 +7,6 @@ import pandas as pd
 import numpy as np
 from coinbase.rest import RESTClient  # coinbase-advanced-py
 
-
 # ============== Config ==============
 SHEET_NAME        = os.getenv("SHEET_NAME", "Trading Log")
 PRODUCTS_TAB      = os.getenv("CRYPTO_PRODUCTS_TAB", "crypto_products")
@@ -20,14 +19,13 @@ RSI_MAX           = float(os.getenv("RSI_MAX", "65"))
 MAX_EXT_EMA20_PCT = float(os.getenv("MAX_EXT_EMA20_PCT", "0.08"))        # 8%
 REQUIRE_7D_HIGH   = os.getenv("REQUIRE_7D_HIGH", "true").lower() in ("1","true","yes")
 
+PER_PRODUCT_SLEEP = float(os.getenv("PER_PRODUCT_SLEEP", "0.15"))        # nicer to the API
 
 # ============== Small utils ==============
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
 def g(obj: Any, *names: str, default=None):
-    """Get the first present attribute/key from an object or dict."""
     for n in names:
         if isinstance(obj, dict):
             if n in obj and obj[n] not in (None, ""):
@@ -38,12 +36,19 @@ def g(obj: Any, *names: str, default=None):
                 return v
     return default
 
-
 def _floor_to_4h(dt_utc: datetime) -> datetime:
-    """Floor a UTC datetime to the most recent closed 4h boundary (00,04,08,12,16,20)."""
     dt_utc = dt_utc.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
     return dt_utc.replace(hour=(dt_utc.hour // 4) * 4)
 
+# Dynamic precision helpers for tiny-priced coins
+def dyn_decimals(price: float, base=6, cap=12) -> int:
+    if price <= 0:
+        return base
+    mag = int(max(0, -math.floor(math.log10(price))))
+    return min(cap, base + mag)
+
+def r_prec(x: float, d: int):
+    return round(float(x), d)
 
 # ============== Sheets helpers ==============
 def get_google_client():
@@ -52,7 +57,6 @@ def get_google_client():
         raise RuntimeError("Missing GOOGLE_CREDS_JSON")
     return gspread.service_account_from_dict(json.loads(raw))
 
-
 def _get_ws(gc, tab_name: str):
     sh = gc.open(SHEET_NAME)
     try:
@@ -60,13 +64,11 @@ def _get_ws(gc, tab_name: str):
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=tab_name, rows="2000", cols="50")
 
-
 def write_products(ws, products: List[str]):
     ws.clear()
     ws.append_row(["Product"])
     if products:
         ws.append_rows([[p] for p in products], value_input_option="USER_ENTERED")
-
 
 def write_screener(ws, rows: List[List[Any]]):
     ws.clear()
@@ -79,13 +81,10 @@ def write_screener(ws, rows: List[List[Any]]):
     for i in range(0, len(rows), 100):
         ws.append_rows(rows[i:i+100], value_input_option="USER_ENTERED")
 
-
 # ============== Coinbase helpers ==============
-CB = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET from env
-
+CB = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET
 
 def all_usd_products() -> List[str]:
-    """All ONLINE *-USD products from Coinbase Advanced (unique, sorted)."""
     prods = []
     cursor = None
     while True:
@@ -104,13 +103,10 @@ def all_usd_products() -> List[str]:
         cursor = g(resp, "cursor")
         if not cursor:
             break
-    # de-dup & sort
     return sorted(dict.fromkeys(prods))
 
-
 def get_candles_4h(product_id: str, bars: int) -> pd.DataFrame:
-    """Fetch FOUR_HOUR candles using epoch seconds, aligned to closed candle boundaries."""
-    end_dt = _floor_to_4h(datetime.now(timezone.utc))          # last CLOSED 4h mark
+    end_dt = _floor_to_4h(datetime.now(timezone.utc))
     start_dt = end_dt - timedelta(hours=bars * 4)
 
     start_epoch = int(start_dt.timestamp())
@@ -118,8 +114,8 @@ def get_candles_4h(product_id: str, bars: int) -> pd.DataFrame:
 
     resp = CB.get_candles(
         product_id=product_id,
-        start=start_epoch,     # epoch seconds
-        end=end_epoch,         # epoch seconds
+        start=start_epoch,
+        end=end_epoch,
         granularity="FOUR_HOUR"
     )
 
@@ -139,7 +135,6 @@ def get_candles_4h(product_id: str, bars: int) -> pd.DataFrame:
     df = pd.DataFrame(out).sort_values("start")
     return df.tail(bars).reset_index(drop=True)
 
-
 # ============== Indicators ==============
 def ema(s, w): return s.ewm(span=w, adjust=False).mean()
 def sma(s, w): return s.rolling(w).mean()
@@ -157,7 +152,6 @@ def macd(series, fast=12, slow=26, signal=9):
     line = ef - es; sig = ema(line, signal)
     hist = line - sig
     return line, sig, hist
-
 
 # ============== Analyze one ==============
 def analyze(product_id: str):
@@ -180,21 +174,17 @@ def analyze(product_id: str):
     hist_prev = float(macd_hist.iloc[-2]) if macd_hist.shape[0] >= 2 else np.nan
     hist_delta= hist_v - hist_prev if not math.isnan(hist_prev) else np.nan
 
-    # 24h notional = sum of last 6x4h (close * volume)
     vol24_usd = float((close.tail(6) * vol.tail(6)).sum())
-
-    # 7D high (42 x 4h bars) based on closes
     high_7d = float(close.tail(42).max())
     breakout = price >= high_7d - 1e-9
 
-    # Filters
     if not (price > ema20 > sma50):
         return None
     if (price / ema20 - 1.0) > MAX_EXT_EMA20_PCT:
         return None
     if not (RSI_MIN < rsi14 < RSI_MAX):
         return None
-    if not (macd_v > signal_v and hist_v > 0 and (not math.isnan(hist_delta) and hist_delta > 0)):
+    if not ( (macd_v > signal_v) and (hist_v > 0) and (not math.isnan(hist_delta) and hist_delta > 0) ):
         return None
     if vol24_usd < MIN_24H_NOTIONAL:
         return None
@@ -204,29 +194,31 @@ def analyze(product_id: str):
     reason = (
         f"4h Uptrend (P>EMA20>SMA50), RSI {RSI_MIN}-{RSI_MAX}, "
         f"MACD>Signal & Hist↑, ≤{int(MAX_EXT_EMA20_PCT*100)}% above EMA20, "
-        f"24h notional ≥ ${int(MIN_24H_NOTIONAL):,}"
-        + (" + 7D breakout" if REQUIRE_7D_HIGH else "")
+        f"24h notional ≥ ${int(MIN_24H_NOTIONAL):,}" + (" + 7D breakout" if REQUIRE_7D_HIGH else "")
     )
+
+    # dynamic precision for tiny-priced assets
+    d = dyn_decimals(price)         # base precision tied to price magnitude
+    d2 = min(14, d + 2)
 
     row = [
         product_id,
-        round(price, 6),
-        round(ema20, 6),
-        round(sma50, 6),
+        r_prec(price, d),
+        r_prec(ema20, d),
+        r_prec(sma50, d),
         round(rsi14, 2),
-        round(macd_v, 6),
-        round(signal_v, 6),
-        round(hist_v, 6),
-        round(hist_delta, 6) if not math.isnan(hist_delta) else "",
+        r_prec(macd_v, d),
+        r_prec(signal_v, d),
+        r_prec(hist_v, d),
+        r_prec(hist_delta, d2) if not math.isnan(hist_delta) else "",
         int(vol24_usd),
-        round(high_7d, 6),
+        r_prec(high_7d, d),
         "✅" if breakout else "",
         "✅",
         reason,
         now_iso(),
     ]
     return row
-
 
 # ============== Main ==============
 def main():
@@ -249,11 +241,10 @@ def main():
             print(f"⚠️ {pid} analyze error: {e}")
         if i % 20 == 0:
             print(f"   • analyzed {i}/{len(products)}")
-        time.sleep(0.05)
+        time.sleep(PER_PRODUCT_SLEEP * (0.8 + 0.4 * random.random()))
 
     write_screener(ws_screener, rows)
     print(f"✅ Screener wrote {len(rows)} picks to {SCREENER_TAB}")
-
 
 if __name__ == "__main__":
     try:
