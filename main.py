@@ -12,24 +12,22 @@ SHEET_NAME        = os.getenv("SHEET_NAME", "Trading Log")
 PRODUCTS_TAB      = os.getenv("CRYPTO_PRODUCTS_TAB", "crypto_products")
 SCREENER_TAB      = os.getenv("CRYPTO_SCREENER_TAB", "crypto_screener")
 LOG_TAB           = os.getenv("CRYPTO_LOG_TAB", "crypto_log")
-COST_TAB          = os.getenv("CRYPTO_COST_TAB", "crypto_cost")
 
-LOOKBACK_4H       = int(os.getenv("LOOKBACK_4H", "200"))            # number of 4h bars
-MIN_24H_NOTIONAL  = float(os.getenv("MIN_24H_NOTIONAL", "2000000")) # USD
+LOOKBACK_4H       = int(os.getenv("LOOKBACK_4H", "200"))
+MIN_24H_NOTIONAL  = float(os.getenv("MIN_24H_NOTIONAL", "2000000"))
 RSI_MIN           = float(os.getenv("RSI_MIN", "50"))
 RSI_MAX           = float(os.getenv("RSI_MAX", "65"))
-MAX_EXT_EMA20_PCT = float(os.getenv("MAX_EXT_EMA20_PCT", "0.08"))   # 8%
+MAX_EXT_EMA20_PCT = float(os.getenv("MAX_EXT_EMA20_PCT", "0.08"))
 REQUIRE_7D_HIGH   = os.getenv("REQUIRE_7D_HIGH", "true").lower() in ("1","true","yes")
 PER_PRODUCT_SLEEP = float(os.getenv("PER_PRODUCT_SLEEP", "0.15"))
 
-# ---------- Headers shared with other bots ----------
+# ---------- Headers ----------
 SCREENER_HEADERS = [
     "Product","Price","EMA_20","SMA_50","RSI_14",
     "MACD","Signal","MACD_Hist","MACD_Hist_Δ",
     "Vol24hUSD","7D_High","Breakout","Bullish Signal","Buy Reason","Timestamp"
 ]
 LOG_HEADERS = ["Timestamp","Action","Product","ProceedsUSD","Qty","OrderID","Status","Note"]
-COST_HEADERS = ["Product","Qty","DollarCost","AvgCostUSD","UpdatedAt"]
 
 # ---------- Small utils ----------
 def now_iso() -> str:
@@ -50,7 +48,6 @@ def _floor_to_4h(dt_utc: datetime) -> datetime:
     dt_utc = dt_utc.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
     return dt_utc.replace(hour=(dt_utc.hour // 4) * 4)
 
-# dynamic precision for tiny-priced coins
 def dyn_decimals(price: float, base=6, cap=12) -> int:
     if price <= 0: return base
     mag = int(max(0, -math.floor(math.log10(price))))
@@ -58,7 +55,7 @@ def dyn_decimals(price: float, base=6, cap=12) -> int:
 
 def r_prec(x: float, d: int): return round(float(x), d)
 
-# ---------- Sheets helpers (creates all tabs/headers) ----------
+# ---------- Sheets helpers (creates only needed tabs) ----------
 def get_google_client():
     raw = os.getenv("GOOGLE_CREDS_JSON")
     if not raw:
@@ -69,42 +66,34 @@ def _open_sheet(gc):
     try:
         return gc.open(SHEET_NAME)
     except gspread.exceptions.SpreadsheetNotFound:
-        # Optional: create if the spreadsheet itself was deleted
-        sh = gc.create(SHEET_NAME)
-        return sh
+        return gc.create(SHEET_NAME)
 
-def _ensure_tab(sh, title: str, headers: List[str], keep_data: bool):
-    """Create tab if missing. If keep_data=False, clear then set header. Otherwise only set header if missing."""
+def _ensure_tab(sh, title: str, headers: List[str], clear_first: bool):
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows="2000", cols="50")
-
-    values = ws.get_values("A1:%s1" % chr(ord('A') + len(headers) - 1))
-    need_headers = (not values) or (values[0] != headers)
-
-    if not keep_data:
+    if clear_first:
         ws.clear()
-        ws.update(range_name=f"A1:{chr(ord('A')+len(headers)-1)}1", values=[headers])
-    else:
-        if need_headers:
-            ws.update(range_name=f"A1:{chr(ord('A')+len(headers)-1)}1", values=[headers])
-
+    # ensure header row
+    end_col = chr(ord('A') + len(headers) - 1)
+    vals = ws.get_values(f"A1:{end_col}1")
+    if not vals or vals[0] != headers:
+        ws.update(range_name=f"A1:{end_col}1", values=[headers])
     try: ws.freeze(rows=1)
     except Exception: pass
     return ws
 
-def ensure_all_tabs(gc):
+def ensure_tabs(gc):
     sh = _open_sheet(gc)
-    ws_products = _ensure_tab(sh, PRODUCTS_TAB, ["Product"], keep_data=False)   # finder always rewrites this
-    ws_screener = _ensure_tab(sh, SCREENER_TAB, SCREENER_HEADERS, keep_data=False)  # finder rewrites
-    ws_log      = _ensure_tab(sh, LOG_TAB, LOG_HEADERS, keep_data=True)        # preserve history
-    ws_cost     = _ensure_tab(sh, COST_TAB, COST_HEADERS, keep_data=True)      # preserve basis
-    return ws_products, ws_screener, ws_log, ws_cost
+    ws_products = _ensure_tab(sh, PRODUCTS_TAB, ["Product"], clear_first=True)         # finder rewrites
+    ws_screener = _ensure_tab(sh, SCREENER_TAB, SCREENER_HEADERS, clear_first=True)    # finder rewrites
+    ws_log      = _ensure_tab(sh, LOG_TAB,      LOG_HEADERS,      clear_first=False)   # preserve history
+    return ws_products, ws_screener, ws_log
 
 def write_products(ws, products: List[str]):
     ws.clear()
-    ws.update(range_name="A1:A1", values=[["Product"]])
+    ws.update("A1:A1", [["Product"]])
     if products:
         ws.append_rows([[p] for p in products], value_input_option="USER_ENTERED")
 
@@ -115,7 +104,7 @@ def write_screener(ws, rows: List[List[Any]]):
         ws.append_rows(rows[i:i+100], value_input_option="USER_ENTERED")
 
 # ---------- Coinbase helpers ----------
-CB = RESTClient()  # uses env keys
+CB = RESTClient()
 
 def all_usd_products() -> List[str]:
     prods, cursor = [], None
@@ -202,7 +191,7 @@ def analyze(product_id: str):
     if (price / ema20 - 1.0) > MAX_EXT_EMA20_PCT: return None
     if not (RSI_MIN < rsi14 < RSI_MAX): return None
     if not (macd_v > signal_v and hist_v > 0 and (not math.isnan(hist_delta) and hist_delta > 0)): return None
-    if vol24_usd < MIN_24H_NOTIONAL: return None
+    if vol24_usd < MIN_24H_NOTIONAL): return None
     if REQUIRE_7D_HIGH and not breakout: return None
 
     reason = (
@@ -211,10 +200,8 @@ def analyze(product_id: str):
         f"24h notional ≥ ${int(MIN_24H_NOTIONAL):,}" + (" + 7D breakout" if REQUIRE_7D_HIGH else "")
     )
 
-    d  = dyn_decimals(price)
-    d2 = min(14, d + 2)
-
-    row = [
+    d  = dyn_decimals(price); d2 = min(14, d + 2)
+    return [
         product_id,
         r_prec(price, d),
         r_prec(ema20, d),
@@ -231,16 +218,13 @@ def analyze(product_id: str):
         reason,
         now_iso(),
     ]
-    return row
 
 # ---------- Main ----------
 def main():
-    print("🚀 crypto-finder starting (sheet bootstrapper)")
+    print("🚀 crypto-finder starting (no cost tab)")
     gc = get_google_client()
+    ws_products, ws_screener, ws_log = ensure_tabs(gc)
 
-    ws_products, ws_screener, ws_log, ws_cost = ensure_all_tabs(gc)  # sets up tabs/headers
-
-    # fetch list of tradable USD products
     products = all_usd_products()
     write_products(ws_products, products)
     print(f"📦 ONLINE USD products: {len(products)}")
@@ -258,7 +242,7 @@ def main():
 
     write_screener(ws_screener, rows)
     print(f"✅ Screener wrote {len(rows)} picks to {SCREENER_TAB}")
-    print("🧰 Tabs ensured:", PRODUCTS_TAB, SCREENER_TAB, LOG_TAB, COST_TAB)
+    print("🧰 Tabs ensured:", PRODUCTS_TAB, SCREENER_TAB, LOG_TAB)
 
 if __name__ == "__main__":
     try:
