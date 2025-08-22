@@ -21,6 +21,13 @@ MAX_EXT_EMA20_PCT = float(os.getenv("MAX_EXT_EMA20_PCT", "0.08"))
 REQUIRE_7D_HIGH   = os.getenv("REQUIRE_7D_HIGH", "true").lower() in ("1","true","yes")
 PER_PRODUCT_SLEEP = float(os.getenv("PER_PRODUCT_SLEEP", "0.15"))
 
+# ---- NEW: BTC RSI(4) 4h write-gate (on by default) ----
+BTC_RSI4_GATE_ON   = os.getenv("BTC_RSI4_GATE_ON", "1").lower() in ("1","true","yes")
+BTC_RSI4_PRODUCT   = os.getenv("BTC_RSI4_PRODUCT", "BTC-USD")
+BTC_RSI4_LEN       = int(os.getenv("BTC_RSI4_LEN", "4"))
+BTC_RSI4_THRESH    = float(os.getenv("BTC_RSI4_THRESH", "10"))      # “under 10”
+BTC_RSI4_LOOKBACK  = int(os.getenv("BTC_RSI4_LOOKBACK", "80"))      # bars to fetch for RSI calc
+
 # ---------- Headers ----------
 SCREENER_HEADERS = [
     "Product","Price","EMA_20","SMA_50","RSI_14",
@@ -167,6 +174,18 @@ def macd(series, fast=12, slow=26, signal=9):
     hist = line - sig
     return line, sig, hist
 
+# ---- NEW: BTC RSI(4) 4h helper ----
+def btc_rsi4h_value() -> float:
+    """
+    Latest BTC 4h RSI with window=BTC_RSI4_LEN.
+    Returns float('nan') if unavailable.
+    """
+    df = get_candles_4h(BTC_RSI4_PRODUCT, max(BTC_RSI4_LOOKBACK, BTC_RSI4_LEN + 20))
+    if df.empty or df.shape[0] < (BTC_RSI4_LEN + 2):
+        return float("nan")
+    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+    return float(rsi(close, BTC_RSI4_LEN).iloc[-1])
+
 # ---------- Analyze one ----------
 def analyze(product_id: str):
     df = get_candles_4h(product_id, LOOKBACK_4H)
@@ -254,6 +273,27 @@ def main():
         if i % 20 == 0:
             print(f"   • analyzed {i}/{len(products)}")
         time.sleep(PER_PRODUCT_SLEEP * (0.8 + 0.4 * random.random()))
+
+    # ---- NEW: Gate the write on BTC 4h RSI(4) < threshold ----
+    if BTC_RSI4_GATE_ON:
+        try:
+            btc_rsi4 = btc_rsi4h_value()
+            if not (isinstance(btc_rsi4, (int, float)) and not math.isnan(btc_rsi4)):
+                print("⛔ BTC RSI(4) 4h unavailable — skipping screener write this run.")
+                write_screener(ws_screener, [])
+                print("🧰 Tabs ensured:", PRODUCTS_TAB, SCREENER_TAB, LOG_TAB)
+                return
+            if btc_rsi4 >= BTC_RSI4_THRESH:
+                print(f"⛔ Gate: BTC {BTC_RSI4_PRODUCT} RSI{BTC_RSI4_LEN}(4h) = {btc_rsi4:.2f} ≥ {BTC_RSI4_THRESH:.2f} — not writing picks.")
+                write_screener(ws_screener, [])
+                print("🧰 Tabs ensured:", PRODUCTS_TAB, SCREENER_TAB, LOG_TAB)
+                return
+            print(f"✅ Gate passed: BTC {BTC_RSI4_PRODUCT} RSI{BTC_RSI4_LEN}(4h) = {btc_rsi4:.2f} < {BTC_RSI4_THRESH:.2f} — writing {len(rows)} picks.")
+        except Exception as e:
+            print(f"⛔ BTC RSI gate error: {e} — skipping screener write this run.")
+            write_screener(ws_screener, [])
+            print("🧰 Tabs ensured:", PRODUCTS_TAB, SCREENER_TAB, LOG_TAB)
+            return
 
     write_screener(ws_screener, rows)
     print(f"✅ Screener wrote {len(rows)} picks to {SCREENER_TAB}")
